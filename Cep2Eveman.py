@@ -307,7 +307,9 @@ class Cep2EvemanController:
 
                 if message.topic == "cep2/request/store_event":
                     try:
-                        self.__model.store(Cep2EvemanEvent.from_json(message.payload.decode("utf-8")))
+                        event = Cep2EvemanEvent.from_json(message.payload.decode("utf-8"))
+                        print(f"Storing event {event}")
+                        self.__model.store(event)
                     except KeyError:
                         print(f"Malformed JSON event: {message}")
                 elif message.topic == "cep2/request/get_events":
@@ -318,7 +320,7 @@ class Cep2EvemanController:
                     publish.single(hostname=self.__mqtt_host,
                                    port=self.__mqtt_port,
                                    topic="cep2/response/get_events",
-                                   payload=events)
+                                   payload=json.dumps(events))
 
 
 if __name__ == "__main__":
@@ -327,9 +329,9 @@ if __name__ == "__main__":
     def shutdown(signal, frame):
         stop_daemon.set()
 
-    # Subscribe to signals sent from the terminal, so that the applicaiton is shutdown properly.
-    # When one of the trapped signals is catch, the function shutdown() will be execute. This will
-    # set the stop_daemon event that will then stop the loop that keeps the application running.
+    # Subscribe to signals sent from the terminal, so that the application is shutdown properly.
+    # When one of the trapped signals is captured, the function shutdown() will be execute. This
+    # will set the stop_daemon event that will then stop the loop that keeps the application running.
     signal.signal(signal.SIGHUP, shutdown)
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
@@ -346,7 +348,7 @@ if __name__ == "__main__":
     controller.start_listening()
 
     while not stop_daemon.is_set():
-        # The event times out evey 60 seconds, or when the event is set. if it is set, then the loop
+        # The event times out evey 60 seconds, or when the event is set. If it is set, then the loop
         # will stop and the application will exit.
         stop_daemon.wait(60)
 
