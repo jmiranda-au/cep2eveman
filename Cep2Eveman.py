@@ -16,6 +16,8 @@ from paho.mqtt import publish
 
 @dataclass
 class Cep2EvemanEvent:
+    """ Sensor events to be stored in the database. """
+
     device_id: str
     device_type: str
     measurement: Any
@@ -56,8 +58,9 @@ class Cep2EvemanEvent:
 
 
 class Cep2EvemanModel:
-    # IMPORTANT: this is a very simplistic example of a database, so th eexmaple is easier to
-    # understand. By no measn this is a right approach for this database.
+    """ Model to store sensor events into a MySQL database. """
+    # IMPORTANT: this is a very simplistic example of a database, so the exmaple is easier to
+    # understand. By no means this is a right approach for this database.
     # The first limitation of this database is the lack of a device table, which makes the database
     # not conform with the 2nd normal form (2NF), i.e. there should be a devices table that has
     # multiple events.
@@ -93,6 +96,7 @@ class Cep2EvemanModel:
         # If the connection is already open, then don't do anything.
         if self.__mysql_connection:
             return
+
         try:
             self.__mysql_connection = mysql_connect(host=self.__host,
                                                     user=self.__user,
@@ -116,8 +120,12 @@ class Cep2EvemanModel:
         self.__mysql_connection.close()
         self.__mysql_connection = None
 
-    def get_events(self) -> List[Cep2EvemanEvent]:
-        """ Gets the full list of events.
+    def get_events(self, device_id: str = None) -> List[Cep2EvemanEvent]:
+        """ Gets the full list of events. If the device_id argument is givem then only the events
+        for the device are returned.
+
+        Args:
+            device_id (str): device_id to filter the device's events
 
         Raises:
             RuntimeError: a connection to the database was not established.
@@ -130,7 +138,9 @@ class Cep2EvemanModel:
         if not self.__mysql_connection:
             raise RuntimeError(f"Not connected to database {self.__database}.")
 
-        query = "SELECT device_id, device_type, measurement, timestamp FROM events;"
+        query = ("SELECT device_id, device_type, measurement, timestamp FROM events;"
+                 if not device_id else
+                 f'SELECT device_id, device_type, measurement, timestamp FROM events WHERE device_id = "{device_id}";')
         cursor = self.__mysql_connection.cursor()
         events = []
 
@@ -139,20 +149,18 @@ class Cep2EvemanModel:
 
         # Parse all the results from the query. The measurements are stored in the database as
         # strings. When parsing them, convert to the correct type.
-        #
-
-        for (did, dt, m, ts) in cursor:
-            if m.isdigit():
-                measurement = int(m)
-            elif m.lower() in ("true", "false"):
-                measurement = bool(strtobool(m))
+        for (device_id, device_type, measurement, timestamp) in cursor:
+            if measurement.isdigit():
+                casted_measurement = int(measurement)
+            elif measurement.lower() in ("true", "false"):
+                casted_measurement = bool(strtobool(measurement))
             else:
-                measurement = m
+                casted_measurement = measurement
 
-            events.append(Cep2EvemanEvent(device_id=did,
-                                    device_type=dt,
-                                    measurement=measurement,
-                                    timestamp=ts))
+            events.append(Cep2EvemanEvent(device_id=device_id,
+                                          device_type=device_type,
+                                          measurement=casted_measurement,
+                                          timestamp=timestamp))
 
         return events
 
@@ -160,13 +168,14 @@ class Cep2EvemanModel:
         if not self.__mysql_connection:
             raise RuntimeError(f"Not connected to database {self.__database}.")
 
-        query = (f"INSERT INTO events (device_id,device_type,measurement,timestamp)"
-                 f"VALUES(%s, %s, %s, %s);")
+        query = ("INSERT INTO events (device_id,device_type,measurement,timestamp)"
+                 "VALUES(%s, %s, %s, %s);")
         cursor = self.__mysql_connection.cursor()
 
         # If the value is a boolean, then convert it to a string in the format "true" or "false".
         # Other value types will be automatically converted to a string, once the query is executed.
-        measurement = (str(event.measurement).lower()if isinstance(event.measurement, bool)
+        measurement = (str(event.measurement).lower()
+                       if isinstance(event.measurement, bool)
                        else event.measurement)
 
         cursor.execute(query,
@@ -187,6 +196,7 @@ class Cep2EvemanModel:
 
             for table_name in self.TABLES:
                 table_description = self.TABLES[table_name]
+
                 try:
                     print(f"Creating table {table_name}: ", end="")
                     cursor.execute(table_description)
@@ -203,7 +213,13 @@ class Cep2EvemanModel:
 
 
 class Cep2EvemanController:
-    TOPIC = "cep2/#"
+    """ Listen for MQTT messages that contain sensor events and store them into the model. """
+
+    TOPIC_MAIN_LEVEL = "cep2"
+    ALL_TOPICS = f"{TOPIC_MAIN_LEVEL}/#"
+    GET_EVENTS_REQUEST_TOPIC = f"{TOPIC_MAIN_LEVEL}/request/get_events"
+    GET_EVENTS_RESPONSE_TOPIC = f"{TOPIC_MAIN_LEVEL}/response/get_events"
+    STORE_EVENTS_TOPIC = f"{TOPIC_MAIN_LEVEL}/request/store_event"
 
     def __init__(self, mqtt_host: str, model: Cep2EvemanModel, mqtt_port: int = 1883) -> None:
         self.__connected = False
@@ -231,10 +247,10 @@ class Cep2EvemanController:
 
         # Connect to the host given in initializer.
         self.__mqtt_client.connect(self.__mqtt_host,
-                              self.__mqtt_port)
+                                   self.__mqtt_port)
         self.__mqtt_client.loop_start()
         # Subscribe to all topics given in the initializer.
-        self.__mqtt_client.subscribe(self.TOPIC)
+        self.__mqtt_client.subscribe(self.ALL_TOPICS)
         # Start the subscriber thread.
         self.__subscriber_thread.start()
 
@@ -243,7 +259,7 @@ class Cep2EvemanController:
         """
         self.__stop_worker.set()
         self.__mqtt_client.loop_stop()
-        self.__mqtt_client.unsubscribe(self.TOPIC)
+        self.__mqtt_client.unsubscribe(self.ALL_TOPICS)
         self.__mqtt_client.disconnect()
 
         # Disconnect from the database
@@ -305,25 +321,39 @@ class Cep2EvemanController:
                 if not message:
                     return
 
-                if message.topic == "cep2/request/store_event":
+                if message.topic == self.STORE_EVENTS_TOPIC:
                     try:
                         event = Cep2EvemanEvent.from_json(message.payload.decode("utf-8"))
                         print(f"Storing event {event}")
                         self.__model.store(event)
                     except KeyError:
                         print(f"Malformed JSON event: {message}")
-                elif message.topic == "cep2/request/get_events":
+                elif message.topic == self.GET_EVENTS_REQUEST_TOPIC:
+                    # Try to parse a json message with a payload of such as
+                    # {"deviceId": "0x588e81fffe"}
+                    # If a JSON payload is found, then it is parsed and the deviceId is used to
+                    # retrive the events for this device. Other filter arugmetns can be addded here.
+                    # If the payload has unknown keys, then the deviceId is None and all events are
+                    # returned.
+                    try:
+                        json_obj = json.loads(message.payload.decode("utf-8"))
+                    except json.JSONDecodeError as ex:
+                        if message.payload:
+                            print(f"Couldn't parse the JSON payload: {ex}")
+                        device_id = None
+                    else:
+                        device_id = json_obj.get("deviceId")
                     # A get_events was received. thus retrieve the values from the database and
                     # publish them to the response topic.
-                    events = [e.to_json() for e in self.__model.get_events()]
+                    events = [e.to_json() for e in self.__model.get_events(device_id)]
 
                     publish.single(hostname=self.__mqtt_host,
                                    port=self.__mqtt_port,
-                                   topic="cep2/response/get_events",
+                                   topic=self.GET_EVENTS_RESPONSE_TOPIC,
                                    payload=json.dumps(events))
 
 
-if __name__ == "__main__":
+def main():
     stop_daemon = Event()
 
     def shutdown(signal, frame):
@@ -336,14 +366,14 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    # Instante model to connect to a database running in the same machine (localhost).
+    # Instantiate the model to connect to a database running in the same machine (localhost).
     model = Cep2EvemanModel(host="localhost",
-                           database="cep2",
-                           user="cep2",
-                           password="cep2")
+                            database="cep2",
+                            user="cep2",
+                            password="cep2")
     # The controller will connect to a MQTT broker running in the same machine.
     controller = Cep2EvemanController(model=model,
-                                     mqtt_host="localhost")
+                                      mqtt_host="localhost")
 
     controller.start_listening()
 
@@ -353,3 +383,7 @@ if __name__ == "__main__":
         stop_daemon.wait(60)
 
     controller.stop_listening()
+
+
+if __name__ == "__main__":
+    main()
